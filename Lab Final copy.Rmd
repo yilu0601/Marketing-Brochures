@@ -2,14 +2,16 @@
 title: "Lab Final"
 author: "Irene"
 date: "2024-05-30"
-output: html_document
+output:
+  pdf_document: default
+  html_document: default
 ---
 
 ```{r}
 library(caret)
 library(glmnet)
 set.seed(1234)
-data <- read.csv("Competition_data.csv")
+data <- read.csv("Competition_data copy.csv")
 
 # Remove ID and zip code
 data <- subset(data, select = -c(HHKEY, ZIP_CODE))
@@ -31,9 +33,24 @@ data <- cbind(data, dummy_matrix)
 data$CLUSTYPE <- NULL
 
 # Split data into training and testing sets
-train_indices <- createDataPartition(data$RESP, p = 0.8, list = FALSE)
-train_data <- data[train_indices, ]
-test_data <- data[-train_indices, ]
+#train_indices <- createDataPartition(data$RESP, p = 0.8, list = FALSE)
+#train_data <- data[train_indices, ]
+#test_data <- data[-train_indices, ]
+
+# Split into training (60%) and remaining (40%)
+train_index <- createDataPartition(data$RESP, p = 0.60, list = FALSE)
+
+train_data <- data[train_index, ]
+remaining_data <- data[-train_index, ]
+
+# Split remaining data into validation (20%) and testing (20%)
+test_index <- createDataPartition(remaining_data$RESP, p = 0.50, list = FALSE)
+
+test_data <- remaining_data[test_index, ]
+validation_data <- remaining_data[-test_index, ]
+
+counts <- table(data$RESP)
+prop.table(counts)
 
 ```
 
@@ -44,6 +61,7 @@ preProc <- preProcess(subset(train_data, select = -c(RESP, CC_CARD, WEB, CLUSTYP
 
 # Transform data
 train_scaled <- predict(preProc, train_data)
+val_scaled <- predict(preProc, validation_data)
 test_scaled <- predict(preProc, test_data)
 ```
 
@@ -53,6 +71,7 @@ set.seed(1234)
 # Versions of train and test
 X_train <- subset(train_scaled, select = -RESP)
 X_test <- subset(test_scaled, select = -RESP)
+X_val <- subset(val_scaled, select = -RESP)
 
 X_train$WEB <- as.numeric(X_train$WEB)
 X_train$VALPHON <- as.numeric(X_train$VALPHON)
@@ -60,6 +79,7 @@ X_train$CC_CARD <- as.numeric(X_train$CC_CARD)
 
 y_train <- train_scaled$RESP
 y_test <- test_scaled$RESP
+y_val <- val_scaled$RESP
 
 # Lasso to find predictors
 # Fit Lasso model using cross-validation to find the optimal lambda
@@ -93,6 +113,8 @@ train_scaled <- subset(train_scaled, select = select)
 train_scaled$CLUSTYPE7 <- as.factor(train_scaled$CLUSTYPE7)
 test_scaled <- subset(test_scaled, select = select)
 test_scaled$CLUSTYPE7 <- as.factor(test_scaled$CLUSTYPE7)
+val_scaled <- subset(val_scaled, select = select)
+val_scaled$CLUSTYPE7 <- as.factor(val_scaled$CLUSTYPE7)
 
 ```
 
@@ -105,14 +127,52 @@ train_control <- trainControl(method = "cv", number = 5, classProbs = TRUE, summ
 
 rf <- randomForest(RESP ~ ., data = train_scaled, family = "binomial", trControl = train_control, ntree = 500, metric = "ROC")
 save(rf, file = "rf.Rdata")
-predictions <- predict(rf, newdata = test_scaled, type = "prob")
+predictions_val <- predict(rf, newdata = val_scaled, type = "prob")
 ```
+
+Find Optimal Cutoff
+```{r}
+# Try different probability cutoffs
+cutoffs <- seq(0.01, 0.99, by = 0.01)
+
+# Calculate profit for each cutoff
+profits <- sapply(cutoffs, function(cutoff) {
+
+  pred <- ifelse(predictions_val[, 2] > cutoff, 1, 0)
+
+  TP <- sum(pred == 1 & y_val == 1)
+  FP <- sum(pred == 1 & y_val == 0)
+
+  profit <- (170 * TP) - (30 * (TP + FP))
+
+  return(profit)
+})
+
+# Find cutoff that maximizes profit
+best_cutoff <- cutoffs[which.max(profits)]
+best_profit <- max(profits)
+
+best_cutoff
+best_profit
+
+# Plot profit against cutoff
+plot(cutoffs, profits, type = "l",
+     xlab = "Probability Cutoff",
+     ylab = "Profit",
+     main = "Profit vs. Probability Cutoff")
+
+abline(v = best_cutoff, col = "red", lty = 2)
+cutoff <- best_cutoff
+```
+
 
 Prediction
 ```{r}
-cutoff <- 0.21
+predictions <- predict(rf, newdata = test_scaled, type = "prob")
 pred <- ifelse(predictions[,2] > cutoff, 1, 0) # convert to standard predictions format, only need the X1 column
 pred <- as.factor(pred) # make into a factor (for confusion matrix)
+
+confusionMatrix(as.factor(pred), test_scaled$RESP)
 
 TP <- sum(pred == 1 & y_test == 1)
 FP <- sum(pred == 1 & y_test == 0)
@@ -138,17 +198,81 @@ print(paste("Potential Profit Left:",potential_profit))
 print(paste("Accuracy:", accuracy))
 
 ```
+```{r}
+# 1. Base Financials
+gross_revenue_per_responder <- 170
+cost_per_brochure           <- 30
+net_profit_per_responder    <- gross_revenue_per_responder - cost_per_brochure # $140
+
+# 2. Campaign Performance Metrics
+# Total Profit = (Gross Revenue from Buyers) - (Total Cost of Mailing Everyone)
+profit_dt <- (170 * TP) - (30 * (TP + FP))
+
+accuracy  <- (TP + TN) / (TP + TN + FP + FN)
+recall    <- TP / sum(y_test == 1)  # Your percent_TP_captured variable
+
+# 3. Cost & Opportunity Breakdown
+loss_FP          <- cost_per_brochure * FP              # Pure waste on non-responders
+revenue_gained   <- net_profit_per_responder * TP       # Net money made from your targeted buyers
+max_profit       <- net_profit_per_responder * sum(y_test == 1) # If you had a perfect crystal ball
+
+# Money left on the table (Lost profit from False Negatives you didn't mail)
+money_left_on_table <- max_profit - profit_dt
+
+# Percent of profit captured
+percent_profit <- round(100*(profit_dt)/max_profit,2)
+
+# --- Print Summary ---
+print(paste("Confusion Matrix -> TP:", TP, "| FP:", FP, "| TN:", TN, "| FN:", FN))
+print(paste("Model Accuracy:      ", round(accuracy * 100, 2), "%"))
+print(paste("Responders Captured: ", round(recall * 100, 2), "%"))
+print("--------------------------------------------------")
+print(paste("Actual Net Profit:   $", profit_dt))
+print(paste("Wasted Mailing Cost: $", loss_FP))
+print(paste("Max Possible Profit: $", max_profit))
+print(paste("Percent profit captured:", percent_profit, "%"))
+print(paste("Money Left on Table: $", money_left_on_table))
+```
+
 
 Logistic Baseline
 ```{r}
 # Logistic
-logistic <- glm(RESP ~. , data = train_data, family = binomial)
-predictions <- predict(logistic, newdata = test_data, type = "response")
-predicted_label <- ifelse(predictions > 0.5, "1", "0")
-confusionMatrix(as.factor(predicted_label), test_data$RESP)
+logistic <- glm(RESP ~. , data = train_scaled, family = binomial)
+predictions_val <- predict(logistic, newdata = val_scaled, type = "response")
+
+# Try different probability cutoffs
+cutoffs <- seq(0.01, 0.99, by = 0.01)
+
+# Calculate profit for each cutoff
+profits <- sapply(cutoffs, function(cutoff) {
+
+  pred <- ifelse(predictions_val > cutoff, 1, 0)
+
+  TP <- sum(pred == 1 & y_val == 1)
+  FP <- sum(pred == 1 & y_val == 0)
+
+  profit <- (170 * TP) - (30 * (TP + FP))
+
+  return(profit)
+})
+
+# Find cutoff that maximizes profit
+best_cutoff <- cutoffs[which.max(profits)]
+best_profit <- max(profits)
+
+cutoff <- best_cutoff
+
+predictions <- predict(logistic, newdata = test_scaled, type = "response")
+predicted_label <- ifelse(predictions > cutoff, "1", "0")
+confusionMatrix(as.factor(predicted_label), test_scaled$RESP)
 
 TP <- sum(predicted_label == 1 & test_data$RESP == 1)
 FP <- sum(predicted_label == 1 & test_data$RESP == 0)
-profit <- 170 * TP - 30 * (TP + FP)
-profit
+log_profit <- 170 * TP - 30 * (TP + FP)
+log_profit
+
+# Percent of profit captured
+percent_profit <- round(100*(log_profit)/max_profit,2)
+percent_profit
 ```
